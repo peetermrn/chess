@@ -1,10 +1,8 @@
--- Main.hs
 module Main where
 
 import Data.Char
 import Data.List
 import Data.Maybe
-import Text.Parsec.Token (GenLanguageDef (reservedNames))
 
 main :: IO ()
 main = do
@@ -44,50 +42,34 @@ data Board = Board
   }
   deriving (Eq, Show)
 
-white, black :: PieceType -> Maybe Piece
-white pt = Just (Piece White pt)
-black pt = Just (Piece Black pt)
-
 allSquares :: [Square]
 allSquares = [(f, r) | r <- [1 .. 8], f <- ['a' .. 'h']]
 
-emptyBoard :: Board
-emptyBoard =
-  Board
-    { squares = [(sq, Nothing) | sq <- allSquares],
-      toMove = White,
-      status = Normal
-    }
-
-initTable :: Board
-initTable =
-  emptyBoard
+initChessBoard :: Board
+initChessBoard =
+  Board (map getInitialPiece allSquares) White Normal
   where
-    getInitialPiece :: Square -> Maybe Piece
-    -- White back rank
-    getInitialPiece ('a', 1) = white Rook
-    getInitialPiece ('b', 1) = white Knight
-    getInitialPiece ('c', 1) = white Bishop
-    getInitialPiece ('d', 1) = white Queen
-    getInitialPiece ('e', 1) = white King
-    getInitialPiece ('f', 1) = white Bishop
-    getInitialPiece ('g', 1) = white Knight
-    getInitialPiece ('h', 1) = white Rook
-    -- White pawns
-    getInitialPiece (f, 2) = white Pawn
-    -- Black back rank
-    getInitialPiece ('a', 8) = black Rook
-    getInitialPiece ('b', 8) = black Knight
-    getInitialPiece ('c', 8) = black Bishop
-    getInitialPiece ('d', 8) = black Queen
-    getInitialPiece ('e', 8) = black King
-    getInitialPiece ('f', 8) = black Bishop
-    getInitialPiece ('g', 8) = black Knight
-    getInitialPiece ('h', 8) = black Rook
-    -- Black pawns
-    getInitialPiece (f, 7) = black Pawn
-    -- Empty squares
-    getInitialPiece _ = Nothing
+    getInitialPiece :: Square -> (Square, Maybe Piece)
+    getInitialPiece sq = case sq of
+      ('a', 1) -> (sq, Just (Piece White Rook))
+      ('b', 1) -> (sq, Just (Piece White Knight))
+      ('c', 1) -> (sq, Just (Piece White Bishop))
+      ('d', 1) -> (sq, Just (Piece White Queen))
+      ('e', 1) -> (sq, Just (Piece White King))
+      ('f', 1) -> (sq, Just (Piece White Bishop))
+      ('g', 1) -> (sq, Just (Piece White Knight))
+      ('h', 1) -> (sq, Just (Piece White Rook))
+      (f, 2) -> (sq, Just (Piece White Pawn)) -- White pawns
+      ('a', 8) -> (sq, Just (Piece Black Rook))
+      ('b', 8) -> (sq, Just (Piece Black Knight))
+      ('c', 8) -> (sq, Just (Piece Black Bishop))
+      ('d', 8) -> (sq, Just (Piece Black Queen))
+      ('e', 8) -> (sq, Just (Piece Black King))
+      ('f', 8) -> (sq, Just (Piece Black Bishop))
+      ('g', 8) -> (sq, Just (Piece Black Knight))
+      ('h', 8) -> (sq, Just (Piece Black Rook))
+      (f, 7) -> (sq, Just (Piece Black Pawn)) -- Black pawns
+      _ -> (sq, Nothing) -- Empty squares
 
 data Move = Move
   { from :: Square,
@@ -111,16 +93,13 @@ data Game = Game
 initializeGame :: Game
 initializeGame =
   Game
-    { board = initTable,
+    { board = initChessBoard,
       history = [],
       lastMove = Nothing,
       castling = [WhiteKingSide, WhiteQueenSide, BlackQueenSide, BlackKingSide],
       enPassantSq = Nothing,
       moveCount = 0
     }
-
-findPiece :: Square -> [(Square, Maybe Piece)] -> Maybe Piece
-findPiece sq boardList = fromMaybe Nothing (lookup sq boardList)
 
 getKingLocation :: Board -> PieceColor -> Square
 getKingLocation b color =
@@ -132,30 +111,6 @@ getKingLocation b color =
     isMatchingPiece (_, Just (Piece c King)) = c == color
     isMatchingPiece _ = False
 
-getNextLetter :: Char -> Maybe Char
-getNextLetter c =
-  case c of
-    'a' -> Just 'b'
-    'b' -> Just 'c'
-    'c' -> Just 'd'
-    'd' -> Just 'e'
-    'e' -> Just 'f'
-    'f' -> Just 'g'
-    'g' -> Just 'h'
-    'h' -> Nothing
-
-getPreviousLetter :: Char -> Maybe Char
-getPreviousLetter c =
-  case c of
-    'a' -> Nothing
-    'b' -> Just 'a'
-    'c' -> Just 'b'
-    'd' -> Just 'c'
-    'e' -> Just 'd'
-    'f' -> Just 'e'
-    'g' -> Just 'f'
-    'h' -> Just 'g'
-
 pieceAt :: Board -> Char -> Int -> Maybe Piece
 pieceAt b l n =
   case lookup (l, n) (squares b) of
@@ -166,19 +121,10 @@ squareEmpty :: Board -> Char -> Int -> Bool
 squareEmpty b l n =
   n >= 1 && n <= 8 && l >= 'a' && l <= 'h' && isNothing (pieceAt b l n)
 
-mkPawnMoves :: Square -> Square -> [Move]
-mkPawnMoves fromSq toSq@(_, rank)
-  | rank == 8 || rank == 1 =
-      [Move fromSq toSq (Just pt) False | pt <- [Queen, Rook, Bishop, Knight]]
-  | otherwise =
-      [Move fromSq toSq Nothing False]
-
-mkPawnMovesCapture :: Square -> Square -> [Move]
-mkPawnMovesCapture fromSq toSq@(_, rank)
-  | rank == 8 || rank == 1 =
-      [Move fromSq toSq (Just pt) True | pt <- [Queen, Rook, Bishop, Knight]]
-  | otherwise =
-      [Move fromSq toSq Nothing True]
+mkPawnMoves :: Square -> Square -> Bool -> [Move]
+mkPawnMoves fromSq toSq@(_, rank) capt
+  | rank == 8 || rank == 1 = [Move fromSq toSq (Just pt) capt | pt <- [Queen, Rook, Bishop, Knight]]
+  | otherwise = [Move fromSq toSq Nothing capt]
 
 moveFile :: Char -> Int -> Maybe Char
 moveFile f offset =
@@ -221,21 +167,16 @@ isCheckForColor b col =
             pawnFiles
 
     anyKnightAttacking =
-      let offsets = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
-       in any
-            ( \(df, dr) -> case (moveFile l df, moveRank n dr) of
-                (Just f', Just r') -> isEnemyPiece Knight f' r'
-                _ -> False
-            )
-            offsets
+      any
+        ( \(df, dr) -> case (moveFile l df, moveRank n dr) of
+            (Just f', Just r') -> isEnemyPiece Knight f' r'
+            _ -> False
+        )
+        [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
 
-    anyRookAttacking =
-      let directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
-       in any (\dir -> checkDirection dir [Rook, Queen] l n) directions
+    anyRookAttacking = any (\dir -> checkDirection dir [Rook, Queen] l n) [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
-    anyBishopAttacking =
-      let directions = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-       in any (\dir -> checkDirection dir [Bishop, Queen] l n) directions
+    anyBishopAttacking = any (\dir -> checkDirection dir [Bishop, Queen] l n) [(-1, -1), (1, -1), (1, 1), (-1, 1)]
 
     anyKingAttacking =
       let offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
@@ -267,7 +208,7 @@ getInDir board (df, dr) ownColor enemyColor (f, r) =
 
 getPseudoPossibleMovesForSquare :: Board -> Square -> [Move]
 getPseudoPossibleMovesForSquare b sq =
-  case findPiece sq (squares b) of
+  case pieceAt b l n of
     Nothing -> []
     Just (Piece color Pawn) -> pawnMoves
     Just (Piece color Knight) -> knightMoves
@@ -277,9 +218,9 @@ getPseudoPossibleMovesForSquare b sq =
     Just (Piece color Queen) -> queenMoves
   where
     (l, n) = sq
-    color = case pieceAt b l n of 
-              Just (Piece c _) -> c 
-              Nothing -> toMove b
+    color = case pieceAt b l n of
+      Just (Piece c _) -> c
+      Nothing -> toMove b
     enemyColor = if color == White then Black else White
     forward = if color == White then 1 else -1
     startRank = if color == White then 2 else 7
@@ -302,32 +243,16 @@ getPseudoPossibleMovesForSquare b sq =
           canStep1 = squareEmpty b l oneStep
           canStep2 = n == startRank && canStep1 && squareEmpty b l twoStep
 
-          steps =
-            [mkPawnMoves sq (l, oneStep) | canStep1]
-              ++ [mkPawnMoves sq (l, twoStep) | canStep2]
+          steps = [mkPawnMoves sq (l, oneStep) False | canStep1] ++ [mkPawnMoves sq (l, twoStep) False | canStep2]
 
-          captureFiles = catMaybes [getPreviousLetter l, getNextLetter l]
-          captures =
-            [ mkPawnMovesCapture sq (f', oneStep)
-              | f' <- captureFiles,
-                isEnemyAt f' oneStep
-            ]
+          captureFiles = catMaybes [moveFile l (-1), moveFile l 1]
+          captures = [mkPawnMoves sq (f', oneStep) True | f' <- captureFiles, isEnemyAt f' oneStep]
        in -- TODO En Passant !!!!!!!
           -- would check if (f', oneStep) == enPassantSq game
 
           concat steps ++ concat captures
     knightMoves =
-      let offsets =
-            [ (-2, -1),
-              (-2, 1),
-              (-1, -2),
-              (-1, 2),
-              (1, -2),
-              (1, 2),
-              (2, -1),
-              (2, 1)
-            ]
-
+      let offsets = [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
           potentialSquares =
             [ (f', r')
               | (df, dr) <- offsets,
@@ -363,8 +288,8 @@ updateBoardSimple :: Board -> Move -> Board -- no status change
 updateBoardSimple (Board squares toMove _) (Move from to promotion _) =
   let newSquares = map updateSquare squares
       updateSquare (sq, p)
-        | sq == from = (sq, Nothing) 
-        | sq == to = (sq, movingPiece) 
+        | sq == from = (sq, Nothing)
+        | sq == to = (sq, movingPiece)
         | otherwise = (sq, p)
       fromPiece = lookup from squares >>= id
       movingPiece = case promotion of
@@ -372,23 +297,14 @@ updateBoardSimple (Board squares toMove _) (Move from to promotion _) =
         Just pt -> Just (Piece toMove pt)
 
       newToMove = if toMove == White then Black else White
-
-      nextBoardNoStatus = Board newSquares newToMove Normal
    in Board newSquares newToMove Normal
 
 isMoveLegal :: Board -> Move -> Bool
-isMoveLegal board move = res
-  where
-    nextBoard = updateBoardSimple board move
-    res = isCheckForColor nextBoard (toMove board)
+isMoveLegal board move = not (isCheckForColor (updateBoardSimple board move) (toMove board))
 
 getAllPseudoLegalMovesForColor :: Board -> PieceColor -> [Move]
 getAllPseudoLegalMovesForColor b color =
-  concat
-    [ getPseudoPossibleMovesForSquare b sq
-      | (sq, Just p) <- squares b,
-        pieceColor p == color
-    ]
+  concat [getPseudoPossibleMovesForSquare b sq | (sq, Just p) <- squares b, pieceColor p == color]
 
 getAllLegalMovesForColor :: Board -> PieceColor -> [Move]
 getAllLegalMovesForColor b col = filter (isMoveLegal b) (getAllPseudoLegalMovesForColor b col)
@@ -421,6 +337,5 @@ updateBoard (Board squares toMove _) (Move from to promotion _) =
         | isCheckForColor nextBoardNoStatus newToMove = Check
         | otherwise = Normal
    in Board newSquares newToMove newStatus
-
 
 -- TODO change pretty much everything to work with the Game type not just board type to allow for easier castling/en passant logic
