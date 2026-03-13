@@ -15,7 +15,7 @@ data PieceColor = White | Black deriving (Eq, Show)
 
 data Piece = Piece {pieceColor :: PieceColor, pieceType :: PieceType} deriving (Eq, Show)
 
-data GameStatus = Normal | Check | CheckMate | StaleMate deriving (Eq, Show)
+data GameStatus = Normal | Check | CheckMate | StaleMate | Draw deriving (Eq, Show)
 
 type Square = (Char, Int)
 
@@ -37,7 +37,8 @@ data Board = Board
     history :: [Move],
     castling :: [CastlingRights],
     enPassantSq :: Maybe Square,
-    moveCount :: Float
+    moveCount :: Float,
+    movesWithoutPawnMoveOrCapture :: Float
   }
   deriving (Eq, Show)
 
@@ -50,6 +51,7 @@ initChessBoard =
     []
     [WhiteKingSide, WhiteQueenSide, BlackQueenSide, BlackKingSide]
     Nothing
+    0
     0
   where
     getInitialPiece :: Square -> (Square, Maybe Piece)
@@ -101,7 +103,7 @@ moveRank r offset =
   let newR = r + offset
    in if newR >= 1 && newR <= 8 then Just newR else Nothing
 
-isSquareUnderAttackFromColor :: Board -> Square -> PieceColor -> Bool
+isSquareUnderAttackFromColor :: Board -> Square -> PieceColor -> Bool -- TODO refactor for readability
 isSquareUnderAttackFromColor b sq col = anyPawnAttacking || anyKnightAttacking || anyRookAttacking || anyBishopAttacking || anyKingAttacking
   where
     (l, n) = sq
@@ -153,7 +155,7 @@ increaseDir (f, r) = (nextF, nextR)
     nextF | f < 0 = f - 1 | f > 0 = f + 1 | otherwise = f
     nextR | r < 0 = r - 1 | r > 0 = r + 1 | otherwise = r
 
-getInDir :: Board -> (Int, Int) -> PieceColor -> PieceColor -> Square -> [Move]
+getInDir :: Board -> (Int, Int) -> PieceColor -> PieceColor -> Square -> [Move] -- TODO refactor to remove this as checkDirection does the same thing essentially
 getInDir board (df, dr) ownColor enemyColor (f, r) = case (moveFile f df, moveRank r dr) of
   (Just nextF, Just nextR) ->
     case pieceAt board nextF nextR of
@@ -164,15 +166,15 @@ getInDir board (df, dr) ownColor enemyColor (f, r) = case (moveFile f df, moveRa
         ([Move (f, r) (nextF, nextR) Nothing True False | col == enemyColor])
   _ -> []
 
-getPseudoPossibleMovesForSquare :: Board -> Square -> [Move]
+getPseudoPossibleMovesForSquare :: Board -> Square -> [Move] -- TODO refactor for readability
 getPseudoPossibleMovesForSquare b sq = case pieceAt b l n of
   Nothing -> []
-  Just (Piece color Pawn) -> pawnMoves
-  Just (Piece color Knight) -> knightMoves
-  Just (Piece color King) -> kingMoves
-  Just (Piece color Bishop) -> bishopMoves
-  Just (Piece color Rook) -> rookMoves
-  Just (Piece color Queen) -> queenMoves
+  Just (Piece c Pawn) -> pawnMoves
+  Just (Piece c Knight) -> knightMoves
+  Just (Piece c King) -> kingMoves
+  Just (Piece c Bishop) -> bishopMoves
+  Just (Piece c Rook) -> rookMoves
+  Just (Piece c Queen) -> queenMoves
   where
     (l, n) = sq
     color = case pieceAt b l n of
@@ -267,20 +269,35 @@ getPseudoPossibleMovesForSquare b sq = case pieceAt b l n of
       let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, -1), (-1, 1), (1, -1)]
        in concat [getInDir b x color enemyColor sq | x <- dirs]
 
-updateBoardSimple :: Board -> Move -> Board -- no status change
-updateBoardSimple (Board squares toMove status history castling enPassant moveCount) (Move from to promotion _ enPassantBool) =
-  let newSquares = map updateSquare squares -- TODO en passant, castling
-      updateSquare (sq, p)
-        | sq == from = (sq, Nothing)
-        | sq == to = (sq, movingPiece)
-        | enPassantBool && sq == (fst to, snd from) = (sq, Nothing) -- TODO check if/why I added this
-        | otherwise = (sq, p)
+updateBoardSimple :: Board -> Move -> Board
+updateBoardSimple board@(Board squares toMove status history castling enPassant moveCount counter) move@(Move from to promotion captureBool enPassantBool) =
+  let isC = isCastling board move
+      (rFrom, rTo) =
+        if isC
+          then case to of
+            ('g', 1) -> (('h', 1), ('f', 1))
+            ('c', 1) -> (('a', 1), ('d', 1))
+            ('g', 8) -> (('h', 8), ('f', 8))
+            ('c', 8) -> (('a', 8), ('d', 8))
+            _ -> (('a', 1), ('a', 1)) -- Fallback???
+          else (('a', 1), ('a', 1))
+
       fromPiece = lookup from squares >>= id
       movingPiece = case promotion of
         Nothing -> fromPiece
         Just pt -> Just (Piece toMove pt)
+      newCounter = if captureBool || movingPiece == Just (Piece toMove Pawn) then 0 else 0.5 + counter
+      updateSquare (sq, p)
+        | sq == from = (sq, Nothing)
+        | sq == to = (sq, movingPiece)
+        | enPassantBool && sq == (fst to, snd from) = (sq, Nothing)
+        | isC && sq == rFrom = (sq, Nothing) -- Remove Rook from old square
+        | isC && sq == rTo = (sq, lookup rFrom squares >>= id) -- Add Rook to new square
+        | otherwise = (sq, p)
+
+      newSquares = map updateSquare squares
       newToMove = if toMove == White then Black else White
-   in Board newSquares newToMove Normal history castling enPassant moveCount -- TODO history etc
+   in Board newSquares newToMove Normal history castling enPassant moveCount newCounter
 
 isMoveLegal :: Board -> Move -> Bool
 isMoveLegal board move = not (isCheckForColor (updateBoardSimple board move) (toMove board))
@@ -293,6 +310,45 @@ getAllLegalMovesForColor b col = filter (isMoveLegal b) (getAllPseudoLegalMovesF
 
 isCheckmate :: Board -> Bool
 isCheckmate b = isCheckForColor b (toMove b) && null (getAllLegalMovesForColor b (toMove b))
+
+countPieceAndColor :: [(Square, Maybe Piece)] -> PieceColor -> PieceType -> Int -> Int
+countPieceAndColor [] _ _ count = count
+countPieceAndColor ((_, Just (Piece color pType)) : xs) col refType count =
+  if color == col && pType == refType
+    then countPieceAndColor xs col refType (count + 1)
+    else countPieceAndColor xs col refType count
+
+existsPieceAndColor :: [(Square, Maybe Piece)] -> PieceColor -> PieceType -> Bool
+existsPieceAndColor [] _ _ = False
+existsPieceAndColor ((_, Just (Piece color pType)) : xs) col refType =
+  (color == col && pType == refType) || existsPieceAndColor xs col refType
+
+existsPiece :: [(Square, Maybe Piece)] -> PieceType -> Bool
+existsPiece [] _ = False
+existsPiece ((_, Just (Piece color pType)) : xs) refType =
+  (pType == refType) || existsPiece xs refType
+existsPiece ((_, Nothing) : xs) refType =
+  existsPiece xs refType
+
+isInsufficientMaterial :: Board -> Bool
+isInsufficientMaterial (Board squares _ _ _ _ _ _ _) =
+  not
+    ( existsPiece squares Queen
+        || existsPiece squares Rook
+        || existsPiece squares Pawn
+        || existsPieceAndColor squares Black Bishop && existsPieceAndColor squares Black Knight
+        || existsPieceAndColor squares White Bishop && existsPieceAndColor squares White Knight
+        || countPieceAndColor squares Black Knight 0 >= 2
+        || countPieceAndColor squares White Knight 0 >= 2
+        || countPieceAndColor squares Black Bishop 0 >= 2 -- TODO: check colors as well 
+        || countPieceAndColor squares White Bishop 0 >= 2
+    )
+
+is3FoldRepetition :: Board -> Bool
+is3FoldRepetition b = False -- TODO implement
+
+isDraw :: Board -> Bool
+isDraw b = movesWithoutPawnMoveOrCapture b >= 75 || isInsufficientMaterial b || is3FoldRepetition b
 
 isStalemate :: Board -> Bool
 isStalemate b = not (isCheckForColor b (toMove b)) && null (getAllLegalMovesForColor b (toMove b))
@@ -312,85 +368,97 @@ updateCastlingRights rights (Move from to _ _ _) = filter keep rights
     keep BlackKingSide = from /= ('e', 8) && from /= ('h', 8) && to /= ('h', 8)
     keep BlackQueenSide = from /= ('e', 8) && from /= ('a', 8) && to /= ('a', 8)
 
-updateSquare (sq, p) from to movingPiece
-  | sq == from = (sq, Nothing)
-  | sq == to = (sq, movingPiece)
-  | otherwise = (sq, p)
-
-createNewBoard :: [(Square, Maybe Piece)] -> (Char, Int) -> (Char, Int) -> PieceColor -> [Move] -> [CastlingRights] -> Maybe Square -> Float -> [(Square, Maybe Piece)] -> Maybe PieceType -> Maybe Square -> Board
-createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion newEnPassant =
-  let fromPiece = lookup from squares >>= id
-      movingPiece = case promotion of
-        Nothing -> fromPiece
-        Just pt -> Just (Piece toMove pt)
-      newCastling = updateCastlingRights castling (Move from to promotion False False)
+createNewBoard :: Board -> Move -> [(Square, Maybe Piece)] -> Maybe Square -> Board
+createNewBoard (Board _ toMove _ history castling _ moveCount counter) move newSquares newEnPassant =
+  let newCastling = updateCastlingRights castling move
       newToMove = if toMove == White then Black else White
-      nextBoardNoStatus = Board newSquares newToMove Normal history newCastling newEnPassant moveCount
+
+      newHistory = move : history
+
+      nextBoardNoStatus = Board newSquares newToMove Normal newHistory newCastling newEnPassant moveCount counter
       newStatus
         | isCheckmate nextBoardNoStatus = CheckMate
         | isStalemate nextBoardNoStatus = StaleMate
         | isCheckForColor nextBoardNoStatus newToMove = Check
+        | isDraw nextBoardNoStatus = Draw
         | otherwise = Normal
-   in Board newSquares newToMove newStatus history castling enPassant (moveCount + 0.5)
+
+      newCounter = if isCapture move || uncurry (pieceAt nextBoardNoStatus) (to move) == Just (Piece toMove Pawn) then 0 else counter + 0.5
+   in Board newSquares newToMove newStatus newHistory newCastling newEnPassant (moveCount + 0.5) (newCounter)
 
 updateBoard :: Board -> Move -> Board
-updateBoard (Board squares toMove status history castling enPassant moveCount) (Move from to promotion captBool enPassantBool) =
-  if isCastling (Board squares toMove status history castling enPassant moveCount) (Move from to promotion captBool enPassantBool)
-    then case (from, to) of
-      (('e', 1), ('g', 1)) ->
-        let fromPiece = lookup from squares >>= id
-            rookPiece = Just (Piece White Rook)
-            movingPiece = case promotion of
-              Nothing -> fromPiece
-              Just pt -> Just (Piece toMove pt)
-            newSquares = map (\s -> updateSquare s ('h', 1) ('f', 1) rookPiece) (map (\s -> updateSquare s ('e', 1) ('g', 1) movingPiece) squares)
-         in createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion Nothing
-      (('e', 1), ('c', 1)) ->
-        let fromPiece = lookup from squares >>= id
-            rookPiece = Just (Piece White Rook)
-            movingPiece = case promotion of
-              Nothing -> fromPiece
-              Just pt -> Just (Piece toMove pt)
-            newSquares = map (\s -> updateSquare s ('a', 1) ('d', 1) rookPiece) (map (\s -> updateSquare s ('e', 1) ('c', 1) movingPiece) squares)
-         in createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion Nothing
-      (('e', 8), ('g', 8)) ->
-        let fromPiece = lookup from squares >>= id
-            rookPiece = Just (Piece Black Rook)
-            movingPiece = case promotion of
-              Nothing -> fromPiece
-              Just pt -> Just (Piece toMove pt)
-            newSquares = map (\s -> updateSquare s ('h', 8) ('f', 8) rookPiece) (map (\s -> updateSquare s ('e', 8) ('g', 8) movingPiece) squares)
-         in createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion Nothing
-      (('e', 8), ('c', 8)) ->
-        let fromPiece = lookup from squares >>= id
-            rookPiece = Just (Piece Black Rook)
-            movingPiece = case promotion of
-              Nothing -> fromPiece
-              Just pt -> Just (Piece toMove pt)
-            newSquares = map (\s -> updateSquare s ('a', 8) ('d', 8) rookPiece) (map (\s -> updateSquare s ('e', 8) ('c', 8) movingPiece) squares)
-         in createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion Nothing
-    else
-      if enPassantBool
-        then
-          let fromPiece = lookup from squares >>= id
+updateBoard board@(Board squares toMove _ _ _ _ _ counter) move@(Move from to promotion _ enPassantBool)
+  | isCastling board move =
+      let (rFrom, rTo) = case to of
+            ('g', 1) -> (('h', 1), ('f', 1))
+            ('c', 1) -> (('a', 1), ('d', 1))
+            ('g', 8) -> (('h', 8), ('f', 8))
+            ('c', 8) -> (('a', 8), ('d', 8))
+            _ -> error "Invalid castling move"
+          newSquares =
+            map
+              ( \(s, p) ->
+                  ( if (s == from) || (s == rFrom) -- TODO refactor for readability
+                      then (s, Nothing)
+                      else
+                        ( if s == to
+                            then (s, Just (Piece toMove King))
+                            else
+                              if s == rTo
+                                then (s, Just (Piece toMove Rook))
+                                else (s, p)
+                        )
+                  )
+              )
+              squares
+       in createNewBoard board move newSquares Nothing
+  | enPassantBool =
+      let capturedPawnSq = (fst to, snd from)
+          newSquares =
+            map
+              ( \(s, p) ->
+                  if s == from
+                    then (s, Nothing)
+                    else
+                      if s == to
+                        then (s, Just (Piece toMove Pawn))
+                        else
+                          if s == capturedPawnSq
+                            then (s, Nothing)
+                            else (s, p)
+              )
+              squares
+       in createNewBoard board move newSquares Nothing
+  | otherwise =
+      let fromPiece = lookup from squares >>= id
+          movingPiece = case promotion of
+            Nothing -> fromPiece
+            Just pt -> Just (Piece toMove pt)
+          newSquares =
+            map
+              ( \(s, p) ->
+                  if s == from
+                    then (s, Nothing)
+                    else
+                      if s == to
+                        then (s, movingPiece)
+                        else (s, p)
+              )
+              squares
+          newEnPassant = case movingPiece of
+            Just (Piece c Pawn) ->
+              if abs (snd from - snd to) == 2
+                then Just (fst from, if c == White then snd to - 1 else snd to + 1)
+                else Nothing
+            _ -> Nothing
+       in createNewBoard board move newSquares newEnPassant
 
-              pawnToBeRemoved = (fst to, snd from)
-              movingPiece = case promotion of
-                Nothing -> fromPiece
-                Just pt -> Just (Piece toMove pt)
-
-              newSquares = map (\s -> updateSquare s from to movingPiece) squares
-              squaresAfterEnPassantSquareRemoved = map (\(s, p) -> if s == pawnToBeRemoved then (s, Nothing) else (s, p)) newSquares
-           in createNewBoard squares from to toMove history castling enPassant moveCount squaresAfterEnPassantSquareRemoved promotion Nothing
-        else
-          let fromPiece = lookup from squares >>= id
-              movingPiece = case promotion of
-                Nothing -> fromPiece
-                Just pt -> Just (Piece toMove pt)
-
-              newSquares = map (\s -> updateSquare s from to movingPiece) squares
-              newEnPassant = case movingPiece of
-                Nothing -> Nothing
-                Just (Piece c Pawn) -> if abs (snd from - snd to) == 2 then Just (fst from, (if c == White then (snd to - 1) else snd to + 1)) else Nothing
-                _ -> Nothing
-           in createNewBoard squares from to toMove history castling enPassant moveCount newSquares promotion newEnPassant
+simulateGame :: Board -> Board -- TODO proper implementation of game handler that can later be integrated with gui
+simulateGame b =
+  let moves = getAllLegalMovesForColor b (toMove b)
+   in case moves of
+        [] -> b
+        m : xs ->
+          if status b == Normal || status b == Check
+            then simulateGame (updateBoard b m)
+            else b
