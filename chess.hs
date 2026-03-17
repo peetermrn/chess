@@ -1,4 +1,5 @@
 {- HLINT ignore "Use list comprehension" -}
+{- HLINT ignore "Use join" -}
 module Main where
 
 import Data.Char
@@ -30,15 +31,18 @@ data Move = Move
   }
   deriving (Eq, Show)
 
+type BoardState = ([(Square, Maybe Piece)], PieceColor, [CastlingRights], Maybe Square) -- for 3-fold repetition
+
 data Board = Board
-  { squares :: [(Square, Maybe Piece)],
+  { squares :: [(Square, Maybe Piece)], -- should switch to map for complexity reduction
     toMove :: PieceColor,
     status :: GameStatus,
     history :: [Move],
     castling :: [CastlingRights],
     enPassantSq :: Maybe Square,
     moveCount :: Float,
-    movesWithoutPawnMoveOrCapture :: Float
+    movesWithoutPawnMoveOrCapture :: Float,
+    historyStates :: [BoardState]
   }
   deriving (Eq, Show)
 
@@ -53,6 +57,7 @@ initChessBoard =
     Nothing
     0
     0
+    []
   where
     getInitialPiece :: Square -> (Square, Maybe Piece)
     getInitialPiece sq = case sq of
@@ -103,174 +108,148 @@ moveRank r offset =
   let newR = r + offset
    in if newR >= 1 && newR <= 8 then Just newR else Nothing
 
-isSquareUnderAttackFromColor :: Board -> Square -> PieceColor -> Bool -- TODO refactor for readability
-isSquareUnderAttackFromColor b sq col = anyPawnAttacking || anyKnightAttacking || anyRookAttacking || anyBishopAttacking || anyKingAttacking
+isSquareUnderAttackFromColor :: Board -> Square -> PieceColor -> Bool 
+isSquareUnderAttackFromColor b sq@(l, n) col =
+  anyPawnAttacking || anyKnightAttacking || anyRookAttacking || anyBishopAttacking || anyKingAttacking
   where
-    (l, n) = sq
-    isEnemyPiece pType f' r' = case pieceAt b f' r' of
-      Just (Piece c p') -> c == col && p' == pType
-      _ -> False
+    isEnemyPiece pType f' r' = pieceAt b f' r' == Just (Piece col pType)
 
-    checkDirection (df, dr) targets currF currN =
-      case (moveFile currF df, moveRank currN dr) of
-        (Just nextF, Just nextR) ->
-          case pieceAt b nextF nextR of
-            Nothing -> checkDirection (df, dr) targets nextF nextR
-            Just (Piece c pType) -> c == col && elem pType targets
+    moveSq df dr = do
+      f' <- moveFile l df
+      r' <- moveRank n dr
+      return (f', r')
+
+    hasEnemy pType (df, dr) = case moveSq df dr of
+      Just (f', r') -> isEnemyPiece pType f' r'
+      Nothing -> False
+
+    checkDirection (df, dr) targets (currF, currR) =
+      case (moveFile currF df, moveRank currR dr) of
+        (Just f', Just r') ->
+          case pieceAt b f' r' of
+            Nothing -> checkDirection (df, dr) targets (f', r')
+            Just (Piece c pType) -> c == col && pType `elem` targets
         _ -> False
 
-    anyPawnAttacking =
-      let pawnRank = if col == White then n - 1 else n + 1
-          pawnFiles = [moveFile l (-1), moveFile l 1]
-       in any
-            ( \mf -> case mf of
-                Just f' -> isEnemyPiece Pawn f' pawnRank
-                _ -> False
-            )
-            pawnFiles
-    anyKnightAttacking =
-      any
-        ( \(df, dr) -> case (moveFile l df, moveRank n dr) of
-            (Just f', Just r') -> isEnemyPiece Knight f' r'
-            _ -> False
-        )
-        [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
-    anyRookAttacking = any (\dir -> checkDirection dir [Rook, Queen] l n) [(0, 1), (0, -1), (1, 0), (-1, 0)]
-    anyBishopAttacking = any (\dir -> checkDirection dir [Bishop, Queen] l n) [(-1, -1), (1, -1), (1, 1), (-1, 1)]
-    anyKingAttacking =
-      let offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-       in any
-            ( \(df, dr) -> case (moveFile l df, moveRank n dr) of
-                (Just f', Just r') -> isEnemyPiece King f' r'
-                _ -> False
-            )
-            offsets
+    pDir = if col == White then -1 else 1
+    anyPawnAttacking = any (hasEnemy Pawn) [(-1, pDir), (1, pDir)]
+
+    knightDirs =[(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+    anyKnightAttacking = any (hasEnemy Knight) knightDirs
+
+    kingDirs =[(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    anyKingAttacking = any (hasEnemy King) kingDirs
+
+    rookDirs =[(0, 1), (0, -1), (1, 0), (-1, 0)]
+    anyRookAttacking = any (\dir -> checkDirection dir [Rook, Queen] sq) rookDirs
+
+    bishopDirs =[(-1, -1), (1, -1), (1, 1), (-1, 1)]
+    anyBishopAttacking = any (\dir -> checkDirection dir [Bishop, Queen] sq) bishopDirs
 
 isCheckForColor :: Board -> PieceColor -> Bool
 isCheckForColor b col = isSquareUnderAttackFromColor b (getKingLocation b col) (if col == White then Black else White)
 
-increaseDir :: (Int, Int) -> (Int, Int)
-increaseDir (f, r) = (nextF, nextR)
+
+getMovesInDir :: Board -> (Int, Int) -> PieceColor -> PieceColor -> Square -> Square -> [Move] 
+getMovesInDir board (df, dr) ownColor enemyColor startSq (currF, currR) =
+  case (moveFile currF df, moveRank currR dr) of
+    (Just nextF, Just nextR) ->
+      case pieceAt board nextF nextR of
+        Nothing ->
+          Move startSq (nextF, nextR) Nothing False False
+            : getMovesInDir board (df, dr) ownColor enemyColor startSq (nextF, nextR)
+        Just (Piece col _) ->[Move startSq (nextF, nextR) Nothing True False | col == enemyColor]
+    _ ->[]
+
+
+getPseudoPossibleMovesForSquare :: Board -> Square -> [Move] 
+getPseudoPossibleMovesForSquare b sq@(l, n) = case pieceAt b l n of
+  Nothing ->[]
+  Just p@(Piece c pt) -> case pt of
+    Pawn   -> pawnMoves c
+    Knight -> knightMoves c
+    Bishop -> bishopMoves c
+    Rook   -> rookMoves c
+    Queen  -> queenMoves c
+    King   -> kingMoves c
   where
-    nextF | f < 0 = f - 1 | f > 0 = f + 1 | otherwise = f
-    nextR | r < 0 = r - 1 | r > 0 = r + 1 | otherwise = r
+    enemyColor c = if c == White then Black else White
 
-getInDir :: Board -> (Int, Int) -> PieceColor -> PieceColor -> Square -> [Move] -- TODO refactor to remove this as checkDirection does the same thing essentially
-getInDir board (df, dr) ownColor enemyColor (f, r) = case (moveFile f df, moveRank r dr) of
-  (Just nextF, Just nextR) ->
-    case pieceAt board nextF nextR of
-      Nothing ->
-        Move (f, r) (nextF, nextR) Nothing False False
-          : getInDir board (increaseDir (df, dr)) ownColor enemyColor (f, r)
-      Just (Piece col pType) ->
-        ([Move (f, r) (nextF, nextR) Nothing True False | col == enemyColor])
-  _ -> []
+    moveSq df dr = do
+      f' <- moveFile l df
+      r' <- moveRank n dr
+      return (f', r')
 
-getPseudoPossibleMovesForSquare :: Board -> Square -> [Move] -- TODO refactor for readability
-getPseudoPossibleMovesForSquare b sq = case pieceAt b l n of
-  Nothing -> []
-  Just (Piece c Pawn) -> pawnMoves
-  Just (Piece c Knight) -> knightMoves
-  Just (Piece c King) -> kingMoves
-  Just (Piece c Bishop) -> bishopMoves
-  Just (Piece c Rook) -> rookMoves
-  Just (Piece c Queen) -> queenMoves
-  where
-    (l, n) = sq
-    color = case pieceAt b l n of
-      Just (Piece c _) -> c
-      Nothing -> toMove b
-    enemyColor = if color == White then Black else White
-    forward = if color == White then 1 else -1
-    startRank = if color == White then 2 else 7
-
-    isEnemyAt f' r' = case pieceAt b f' r' of
-      Just (Piece col _) -> col == enemyColor
+    isEnemyAt c f' r' = case pieceAt b f' r' of
+      Just (Piece col _) -> col == enemyColor c
       _ -> False
 
-    mkPawnMoves :: Square -> Square -> Bool -> Bool -> [Move]
-    mkPawnMoves fromSq toSq@(_, rank) capt isEnPassant
-      | rank == 8 || rank == 1 = [Move fromSq toSq (Just pt) capt isEnPassant | pt <- [Queen, Rook, Bishop, Knight]]
-      | otherwise = [Move fromSq toSq Nothing capt isEnPassant]
-
-    classifyMove (f', r') = case pieceAt b f' r' of
+    classifyMove c (f', r') = case pieceAt b f' r' of
       Nothing -> Just (Move sq (f', r') Nothing False False)
       Just (Piece col _) ->
-        if col /= color
+        if col == enemyColor c
           then Just (Move sq (f', r') Nothing True False)
           else Nothing
-    pawnMoves =
-      let oneStep = n + forward
+
+    mkPawnMoves c toSq@(_, rank) capt isEnPassant
+      | rank == 8 || rank == 1 =[Move sq toSq (Just pt) capt isEnPassant | pt <- [Queen, Rook, Bishop, Knight]]
+      | otherwise =[Move sq toSq Nothing capt isEnPassant]
+
+    pawnMoves c =
+      let forward = if c == White then 1 else -1
+          startRank = if c == White then 2 else 7
+          oneStep = n + forward
           twoStep = n + (forward * 2)
 
           canStep1 = squareEmpty b l oneStep
           canStep2 = n == startRank && canStep1 && squareEmpty b l twoStep
 
-          steps = [mkPawnMoves sq (l, oneStep) False False | canStep1] ++ [mkPawnMoves sq (l, twoStep) False False | canStep2]
+          steps = (if canStep1 then mkPawnMoves c (l, oneStep) False False else[])
+               ++ (if canStep2 then mkPawnMoves c (l, twoStep) False False else [])
 
-          captureFiles = catMaybes [moveFile l (-1), moveFile l 1]
+          captureDirs = catMaybes[moveFile l (-1), moveFile l 1]
           captures =
-            [ mkPawnMoves sq (f', oneStep) True (enPassantSq b == Just (f', oneStep))
-              | f' <- captureFiles,
-                isEnemyAt f' oneStep || enPassantSq b == Just (f', oneStep)
-            ]
-       in concat steps ++ concat captures
-    knightMoves =
-      let potentialSquares =
-            [ (f', r')
-              | (df, dr) <- [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)],
-                Just f' <- [moveFile l df],
-                Just r' <- [moveRank n dr]
-            ]
-       in mapMaybe classifyMove potentialSquares
-    kingMoves =
-      let potentialSquares =
-            [ (f', r')
-              | (df, dr) <- [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)],
-                Just f' <- [moveFile l df],
-                Just r' <- [moveRank n dr]
-            ]
-          queenSideEmptySquares = if color == White then [('b', 1), ('c', 1), ('d', 1)] else [('b', 8), ('c', 8), ('d', 8)]
-          kingSideEmptySquares = if color == White then [('f', 1), ('g', 1)] else [('f', 8), ('g', 8)]
+            concat[ mkPawnMoves c (f', oneStep) True isEnPassant
+              | f' <- captureDirs
+              , let isEnPassant = enPassantSq b == Just (f', oneStep)
+              , isEnemyAt c f' oneStep || isEnPassant
+              ]
+       in steps ++ captures
 
-          queenSideSafeSquares = if color == White then [('e', 1), ('d', 1), ('c', 1)] else [('e', 8), ('d', 8), ('c', 8)]
-          kingSideSafeSquares = if color == White then [('e', 1), ('f', 1), ('g', 1)] else [('e', 8), ('f', 8), ('g', 8)]
+    knightMoves c =
+      let dirs =[(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)]
+       in mapMaybe (classifyMove c) (mapMaybe (uncurry moveSq) dirs)
 
-          kingSideToSquare = if color == White then ('g', 1) else ('g', 8)
-          queenSideToSquare = if color == White then ('c', 1) else ('c', 8)
+    kingMoves c =
+      let dirs =[(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+          normalMoves = mapMaybe (classifyMove c) (mapMaybe (uncurry moveSq) dirs)
 
-          areSquaresSafe sqs = not (any (\sq' -> isSquareUnderAttackFromColor b sq' enemyColor) sqs)
-          areSquaresEmpty = all (uncurry (squareEmpty b))
+          queenSideEmpty = if c == White then[('b', 1), ('c', 1), ('d', 1)] else[('b', 8), ('c', 8), ('d', 8)]
+          kingSideEmpty  = if c == White then[('f', 1), ('g', 1)] else [('f', 8), ('g', 8)]
 
-          qSideRight = if color == White then WhiteQueenSide else BlackQueenSide
-          kSideRight = if color == White then WhiteKingSide else BlackKingSide
+          queenSideSafe = if c == White then[('e', 1), ('d', 1), ('c', 1)] else[('e', 8), ('d', 8), ('c', 8)]
+          kingSideSafe  = if c == White then[('e', 1), ('f', 1), ('g', 1)] else[('e', 8), ('f', 8), ('g', 8)]
 
-          queenSideCastleMoves =
-            if elem qSideRight (castling b)
-              && areSquaresEmpty queenSideEmptySquares
-              && areSquaresSafe queenSideSafeSquares
-              then [Move sq queenSideToSquare Nothing False False]
-              else []
+          kingSideTo  = if c == White then ('g', 1) else ('g', 8)
+          queenSideTo = if c == White then ('c', 1) else ('c', 8)
 
-          kingSideCastleMoves =
-            if elem kSideRight (castling b)
-              && areSquaresEmpty kingSideEmptySquares
-              && areSquaresSafe kingSideSafeSquares
-              then [Move sq kingSideToSquare Nothing False False]
-              else []
-       in mapMaybe classifyMove potentialSquares ++ queenSideCastleMoves ++ kingSideCastleMoves
-    bishopMoves =
-      let dirs = [(1, 1), (-1, -1), (-1, 1), (1, -1)]
-       in concat [getInDir b x color enemyColor sq | x <- dirs]
-    rookMoves =
-      let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
-       in concat [getInDir b x color enemyColor sq | x <- dirs]
-    queenMoves =
-      let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, -1), (-1, 1), (1, -1)]
-       in concat [getInDir b x color enemyColor sq | x <- dirs]
+          isSafe sqs = not (any (\sq' -> isSquareUnderAttackFromColor b sq' (enemyColor c)) sqs)
+          isEmpty sqs = all (uncurry (squareEmpty b)) sqs
+
+          qSideRight = if c == White then WhiteQueenSide else BlackQueenSide
+          kSideRight = if c == White then WhiteKingSide else BlackKingSide
+
+          castleQ =[Move sq queenSideTo Nothing False False | qSideRight `elem` castling b, isEmpty queenSideEmpty, isSafe queenSideSafe]
+          castleK =[Move sq kingSideTo Nothing False False | kSideRight `elem` castling b, isEmpty kingSideEmpty, isSafe kingSideSafe]
+
+       in normalMoves ++ castleQ ++ castleK
+
+    bishopMoves c = concat[getMovesInDir b dir c (enemyColor c) sq sq | dir <-[(1, 1), (-1, -1), (-1, 1), (1, -1)]]
+    rookMoves c   = concat[getMovesInDir b dir c (enemyColor c) sq sq | dir <-[(1, 0), (0, 1), (-1, 0), (0, -1)]]
+    queenMoves c  = concat[getMovesInDir b dir c (enemyColor c) sq sq | dir <-[(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, -1), (-1, 1), (1, -1)]]
 
 updateBoardSimple :: Board -> Move -> Board
-updateBoardSimple board@(Board squares toMove status history castling enPassant moveCount counter) move@(Move from to promotion captureBool enPassantBool) =
+updateBoardSimple board@(Board squares toMove status history castling enPassant moveCount counter statesHistory) move@(Move from to promotion captureBool enPassantBool) =
   let isC = isCastling board move
       (rFrom, rTo) =
         if isC
@@ -286,7 +265,7 @@ updateBoardSimple board@(Board squares toMove status history castling enPassant 
       movingPiece = case promotion of
         Nothing -> fromPiece
         Just pt -> Just (Piece toMove pt)
-      newCounter = if captureBool || movingPiece == Just (Piece toMove Pawn) then 0 else 0.5 + counter
+      newCounter = if captureBool || fromPiece == Just (Piece toMove Pawn) then 0 else 0.5 + counter
       updateSquare (sq, p)
         | sq == from = (sq, Nothing)
         | sq == to = (sq, movingPiece)
@@ -297,7 +276,7 @@ updateBoardSimple board@(Board squares toMove status history castling enPassant 
 
       newSquares = map updateSquare squares
       newToMove = if toMove == White then Black else White
-   in Board newSquares newToMove Normal history castling enPassant moveCount newCounter
+   in Board newSquares newToMove Normal history castling enPassant moveCount newCounter statesHistory
 
 isMoveLegal :: Board -> Move -> Bool
 isMoveLegal board move = not (isCheckForColor (updateBoardSimple board move) (toMove board))
@@ -311,41 +290,48 @@ getAllLegalMovesForColor b col = filter (isMoveLegal b) (getAllPseudoLegalMovesF
 isCheckmate :: Board -> Bool
 isCheckmate b = isCheckForColor b (toMove b) && null (getAllLegalMovesForColor b (toMove b))
 
-countPieceAndColor :: [(Square, Maybe Piece)] -> PieceColor -> PieceType -> Int -> Int
-countPieceAndColor [] _ _ count = count
-countPieceAndColor ((_, Just (Piece color pType)) : xs) col refType count =
-  if color == col && pType == refType
-    then countPieceAndColor xs col refType (count + 1)
-    else countPieceAndColor xs col refType count
+countPieceAndColor :: [(Square, Maybe Piece)] -> PieceColor -> PieceType -> Int
+countPieceAndColor sqs col refType = 
+  length $ filter isMatch sqs
+  where isMatch (_, Just (Piece c pt)) = c == col && pt == refType
+        isMatch _ = False
 
-existsPieceAndColor :: [(Square, Maybe Piece)] -> PieceColor -> PieceType -> Bool
-existsPieceAndColor [] _ _ = False
-existsPieceAndColor ((_, Just (Piece color pType)) : xs) col refType =
-  (color == col && pType == refType) || existsPieceAndColor xs col refType
-
-existsPiece :: [(Square, Maybe Piece)] -> PieceType -> Bool
-existsPiece [] _ = False
-existsPiece ((_, Just (Piece color pType)) : xs) refType =
-  (pType == refType) || existsPiece xs refType
-existsPiece ((_, Nothing) : xs) refType =
-  existsPiece xs refType
+existsPiece ::[(Square, Maybe Piece)] -> PieceType -> Bool
+existsPiece sqs refType = any isMatch sqs
+  where isMatch (_, Just (Piece _ pt)) = pt == refType
+        isMatch _ = False
 
 isInsufficientMaterial :: Board -> Bool
-isInsufficientMaterial (Board squares _ _ _ _ _ _ _) =
+isInsufficientMaterial (Board squares _ _ _ _ _ _ _ _) =
   not
     ( existsPiece squares Queen
         || existsPiece squares Rook
         || existsPiece squares Pawn
-        || existsPieceAndColor squares Black Bishop && existsPieceAndColor squares Black Knight
-        || existsPieceAndColor squares White Bishop && existsPieceAndColor squares White Knight
-        || countPieceAndColor squares Black Knight 0 >= 2
-        || countPieceAndColor squares White Knight 0 >= 2
-        || countPieceAndColor squares Black Bishop 0 >= 2 -- TODO: check colors as well 
-        || countPieceAndColor squares White Bishop 0 >= 2
+        || countPieceAndColor squares Black Bishop > 0 && countPieceAndColor squares Black Knight > 0
+        || countPieceAndColor squares White Bishop > 0 && countPieceAndColor squares White Knight > 0
+        || countPieceAndColor squares White Bishop > 0 && countPieceAndColor squares Black Knight > 0-- according to FIDE King + Bishop vs King + Knight is technically not a dead position
+        || countPieceAndColor squares Black Bishop > 0 && countPieceAndColor squares White Knight > 0
+        || countPieceAndColor squares Black Knight >= 2
+        || countPieceAndColor squares White Knight >= 2
+        || bishopsOnDifferentColors squares
     )
+  where
+    -- A square is "light" if the sum of its file's ASCII value and its rank is odd
+    isLightSquare :: Square -> Bool
+    isLightSquare (f, r) = (ord f + r) `mod` 2 /= 0
+
+    bishopsOnDifferentColors :: [(Square, Maybe Piece)] -> Bool -- Checks if there are bishops on both light and dark squares
+    bishopsOnDifferentColors sqs =
+      let bSquares = [sq | (sq, Just (Piece _ Bishop)) <- sqs]
+          hasLight = any isLightSquare bSquares
+          hasDark  = any (not . isLightSquare) bSquares
+      in hasLight && hasDark
 
 is3FoldRepetition :: Board -> Bool
-is3FoldRepetition b = False -- TODO implement
+is3FoldRepetition b = 
+  let currentState = (squares b, toMove b, castling b, enPassantSq b)
+      occurrences = length (filter (== currentState) (historyStates b))
+  in occurrences >= 2 
 
 isDraw :: Board -> Bool
 isDraw b = movesWithoutPawnMoveOrCapture b >= 75 || isInsufficientMaterial b || is3FoldRepetition b
@@ -368,26 +354,40 @@ updateCastlingRights rights (Move from to _ _ _) = filter keep rights
     keep BlackKingSide = from /= ('e', 8) && from /= ('h', 8) && to /= ('h', 8)
     keep BlackQueenSide = from /= ('e', 8) && from /= ('a', 8) && to /= ('a', 8)
 
-createNewBoard :: Board -> Move -> [(Square, Maybe Piece)] -> Maybe Square -> Board
-createNewBoard (Board _ toMove _ history castling _ moveCount counter) move newSquares newEnPassant =
+createNewBoard :: Board -> Move -> [(Square, Maybe Piece)] -> Maybe Square -> Maybe Piece -> Board
+createNewBoard (Board _ toMove _ history castling _ moveCount counter historyStates) move newSquares newEnPassant movingPiece =
   let newCastling = updateCastlingRights castling move
       newToMove = if toMove == White then Black else White
-
       newHistory = move : history
 
-      nextBoardNoStatus = Board newSquares newToMove Normal newHistory newCastling newEnPassant moveCount counter
+      -- Check if the moved piece was a Pawn
+      isPawnMove = case movingPiece of
+        Just (Piece _ Pawn) -> True
+        _ -> False
+
+      newCounter = if isCapture move || isPawnMove then 0 else counter + 0.5
+
+      currentState = (newSquares, newToMove, newCastling, newEnPassant)
+      newHistoryStates = if newCounter == 0 then[] else currentState : historyStates
+
+      nextBoardNoStatus = Board newSquares newToMove Normal newHistory newCastling newEnPassant moveCount newCounter newHistoryStates
+      
+      -- (Optimized status checks - see performance section below)
+      inCheck = isCheckForColor nextBoardNoStatus newToMove
+      legalMoves = getAllLegalMovesForColor nextBoardNoStatus newToMove
+      noLegalMoves = null legalMoves
+
       newStatus
-        | isCheckmate nextBoardNoStatus = CheckMate
-        | isStalemate nextBoardNoStatus = StaleMate
-        | isCheckForColor nextBoardNoStatus newToMove = Check
+        | inCheck && noLegalMoves = CheckMate
+        | not inCheck && noLegalMoves = StaleMate
+        | inCheck = Check
         | isDraw nextBoardNoStatus = Draw
         | otherwise = Normal
 
-      newCounter = if isCapture move || uncurry (pieceAt nextBoardNoStatus) (to move) == Just (Piece toMove Pawn) then 0 else counter + 0.5
-   in Board newSquares newToMove newStatus newHistory newCastling newEnPassant (moveCount + 0.5) (newCounter)
+   in Board newSquares newToMove newStatus newHistory newCastling newEnPassant (moveCount + 0.5) newCounter newHistoryStates
 
 updateBoard :: Board -> Move -> Board
-updateBoard board@(Board squares toMove _ _ _ _ _ counter) move@(Move from to promotion _ enPassantBool)
+updateBoard board@(Board squares toMove _ _ _ _ _ counter historyStates) move@(Move from to promotion _ enPassantBool)
   | isCastling board move =
       let (rFrom, rTo) = case to of
             ('g', 1) -> (('h', 1), ('f', 1))
@@ -395,65 +395,46 @@ updateBoard board@(Board squares toMove _ _ _ _ _ counter) move@(Move from to pr
             ('g', 8) -> (('h', 8), ('f', 8))
             ('c', 8) -> (('a', 8), ('d', 8))
             _ -> error "Invalid castling move"
-          newSquares =
-            map
-              ( \(s, p) ->
-                  ( if (s == from) || (s == rFrom) -- TODO refactor for readability
-                      then (s, Nothing)
-                      else
-                        ( if s == to
-                            then (s, Just (Piece toMove King))
-                            else
-                              if s == rTo
-                                then (s, Just (Piece toMove Rook))
-                                else (s, p)
-                        )
-                  )
-              )
-              squares
-       in createNewBoard board move newSquares Nothing
+          
+          updateSquare (s, p) 
+            | s == from || s == rFrom = (s, Nothing)
+            | s == to                 = (s, Just (Piece toMove King))
+            | s == rTo                = (s, Just (Piece toMove Rook))
+            | otherwise               = (s, p)
+          
+          newSquares = map updateSquare squares
+       in createNewBoard board move newSquares Nothing (Just (Piece toMove King))
   | enPassantBool =
       let capturedPawnSq = (fst to, snd from)
-          newSquares =
-            map
-              ( \(s, p) ->
-                  if s == from
-                    then (s, Nothing)
-                    else
-                      if s == to
-                        then (s, Just (Piece toMove Pawn))
-                        else
-                          if s == capturedPawnSq
-                            then (s, Nothing)
-                            else (s, p)
-              )
-              squares
-       in createNewBoard board move newSquares Nothing
+          updateSquare (s, p) 
+            | s == from           = (s, Nothing)
+            | s == to             = (s, Just (Piece toMove Pawn))
+            | s == capturedPawnSq = (s, Nothing)
+            | otherwise           = (s, p)
+          
+          newSquares = map updateSquare squares
+       in createNewBoard board move newSquares Nothing (Just (Piece toMove Pawn))
   | otherwise =
       let fromPiece = lookup from squares >>= id
           movingPiece = case promotion of
             Nothing -> fromPiece
             Just pt -> Just (Piece toMove pt)
-          newSquares =
-            map
-              ( \(s, p) ->
-                  if s == from
-                    then (s, Nothing)
-                    else
-                      if s == to
-                        then (s, movingPiece)
-                        else (s, p)
-              )
-              squares
+          
+          updateSquare (s, p)
+            | s == from = (s, Nothing)
+            | s == to   = (s, movingPiece)
+            | otherwise = (s, p)
+          
+          newSquares = map updateSquare squares
           newEnPassant = case movingPiece of
             Just (Piece c Pawn) ->
               if abs (snd from - snd to) == 2
                 then Just (fst from, if c == White then snd to - 1 else snd to + 1)
                 else Nothing
             _ -> Nothing
-       in createNewBoard board move newSquares newEnPassant
+       in createNewBoard board move newSquares newEnPassant movingPiece
 
-simulateGame :: Board -> Board -- TODO proper implementation of game handler that can later be integrated with gui
+simulateGame :: Board -> Board -- TODO_6 proper implementation of game handler that can later be integrated with gui
 simulateGame b =
   let moves = getAllLegalMovesForColor b (toMove b)
    in case moves of
